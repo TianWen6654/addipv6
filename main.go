@@ -23,6 +23,7 @@ import (
 	"github.com/byJoey/addipv6/internal/netif"
 	"github.com/byJoey/addipv6/internal/server"
 	"github.com/byJoey/addipv6/internal/store"
+	"github.com/byJoey/addipv6/internal/tunnel"
 )
 
 // version 由构建时的 -ldflags 注入。
@@ -33,6 +34,26 @@ func main() {
 		switch os.Args[1] {
 		case "restore":
 			os.Exit(runRestore(os.Args[2:]))
+		case "ipv4-to-ipv6":
+			os.Exit(runIPv4ToIPv6(os.Args[2:]))
+		case "cloudflare-web":
+			os.Exit(runCloudflareWeb(os.Args[2:]))
+		case "tunnel-config":
+			os.Exit(runTunnelConfig(os.Args[2:]))
+		case "tunnel-supervise":
+			os.Exit(runTunnelSupervisor(os.Args[2:]))
+		case "tunnel-address":
+			if len(os.Args) != 3 {
+				fmt.Fprintln(os.Stderr, "用法：addipv6 tunnel-address <公网路由前缀>")
+				os.Exit(2)
+			}
+			addr, err := tunnel.RoutedAddress(os.Args[2])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			fmt.Println(addr)
+			return
 		case "version", "-v", "--version":
 			fmt.Println("addipv6", version, runtime.GOOS+"/"+runtime.GOARCH)
 			return
@@ -44,12 +65,59 @@ func main() {
 	os.Exit(runServe(os.Args[1:]))
 }
 
+func runTunnelSupervisor(args []string) int {
+	if len(args) != 3 {
+		fmt.Fprintln(os.Stderr, "用法：addipv6 tunnel-supervise <ssh> <SSH配置> <中继列表>")
+		return 2
+	}
+	file, err := os.Open(args[2])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer file.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := tunnel.Supervise(ctx, args[0], args[1], file, os.Stderr); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
+}
+
+// runTunnelConfig is used by the installer. The source profile may contain private keys.
+func runTunnelConfig(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "用法：addipv6 tunnel-config <WireGuard 配置文件> <公网路由前缀>")
+		return 2
+	}
+	file, err := os.Open(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "无法打开 WireGuard 配置文件：", err)
+		return 1
+	}
+	defer file.Close()
+	profile, err := tunnel.Import(file, args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if _, err := fmt.Print(profile); err != nil {
+		return 1
+	}
+	return 0
+}
+
 func usage() {
 	fmt.Print(`addipv6 ` + version + `
 
 用法：
   addipv6 [参数]           起 Web 界面
   addipv6 restore [参数]   把记录过的地址重新加回网卡（开机时用）
+  addipv6 ipv4-to-ipv6 <IPv4> [--nat64 | --nat64-prefix <IPv6/96>]
+  addipv6 cloudflare-web <配置目录> <完整域名或模板> <公网IPv4> [--count N] [--ipv6-only]
+  addipv6 tunnel-config <WireGuard 配置文件> <公网路由前缀>
+  addipv6 tunnel-supervise <ssh> <SSH 配置> <中继列表>
   addipv6 version          看版本
 
 Web 界面常用参数：

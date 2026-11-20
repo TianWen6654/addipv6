@@ -93,7 +93,7 @@ func hasSystemd() bool {
 func writeSystemdUnit(cmdline string) (string, error) {
 	unit := fmt.Sprintf(`[Unit]
 Description=addipv6 开机恢复 IPv6 地址
-Documentation=https://github.com/byJoey/addipv6
+Documentation=https://github.com/TianWen6654/addipv6
 After=network-online.target
 Wants=network-online.target
 

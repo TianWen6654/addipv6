@@ -1,0 +1,52 @@
+name: Build and release
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/release-v*']
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - run: bash -n install.sh && bash -n build.sh && node --check internal/server/web/app.js
+
+  release:
+    if: github.ref_type == 'tag' || startsWith(github.ref_name, 'codex/release-v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build and verify offline bundle
+        run: |
+          VERSION="${GITHUB_REF_NAME#codex/release-}"
+          VERSION="$VERSION" bash build.sh
+          (cd dist && sha256sum --check SHA256SUMS)
+          bundle="$RUNNER_TEMP/addipv6-access"
+          mkdir -p "$bundle/dist"
+          cp install.sh "$bundle/addipv6-install.sh"
+          cp README.md LICENSE "$bundle/"
+          cp dist/addipv6-linux-* dist/SHA256SUMS "$bundle/dist/"
+          tar -czf dist/addipv6-access-linux.tar.gz -C "$RUNNER_TEMP" addipv6-access
+          tar -tzf dist/addipv6-access-linux.tar.gz
+      - name: Publish release
+        run: |
+          VERSION="${GITHUB_REF_NAME#codex/release-}"
+          gh release create "$VERSION" dist/addipv6-linux-* dist/SHA256SUMS dist/addipv6-access-linux.tar.gz \
+            --target "$GITHUB_SHA" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

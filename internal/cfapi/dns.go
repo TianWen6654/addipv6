@@ -29,13 +29,19 @@ type Zone struct {
 
 // Record 是一条 DNS 记录。
 type Record struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	TTL     int    `json:"ttl"`
-	Proxied bool   `json:"proxied"`
-	Comment string `json:"comment"`
+	ID       string            `json:"id"`
+	Type     string            `json:"type"`
+	Name     string            `json:"name"`
+	Content  string            `json:"content"`
+	TTL      int               `json:"ttl"`
+	Proxied  bool              `json:"proxied"`
+	Comment  string            `json:"comment"`
+	Settings DNSRecordSettings `json:"settings"`
+}
+
+type DNSRecordSettings struct {
+	IPv4Only bool `json:"ipv4_only,omitempty"`
+	IPv6Only bool `json:"ipv6_only,omitempty"`
 }
 
 // Managed 判断这条记录是不是本工具建的。
@@ -90,6 +96,10 @@ func (c *Client) ListZones(ctx context.Context) ([]Zone, error) {
 
 // ListRecords 列出指定 zone 的记录，recordType 为空表示不过滤。
 func (c *Client) ListRecords(ctx context.Context, zoneID, recordType string) ([]Record, error) {
+	return c.listRecords(ctx, zoneID, recordType, "")
+}
+
+func (c *Client) listRecords(ctx context.Context, zoneID, recordType, name string) ([]Record, error) {
 	if zoneID == "" {
 		return nil, errors.New("没选站点")
 	}
@@ -100,6 +110,9 @@ func (c *Client) ListRecords(ctx context.Context, zoneID, recordType string) ([]
 		q.Set("page", strconv.Itoa(page))
 		if recordType != "" {
 			q.Set("type", recordType)
+		}
+		if name != "" {
+			q.Set("name.exact", name)
 		}
 		var batch []Record
 		env, err := c.do(ctx, "GET", "/zones/"+url.PathEscape(zoneID)+"/dns_records", q, nil, &batch)
@@ -120,14 +133,108 @@ func (c *Client) ListRecords(ctx context.Context, zoneID, recordType string) ([]
 	return all, nil
 }
 
+type WebProxyResult struct {
+	Name    string
+	Created bool
+	Updated bool
+}
+
+type webProxyPlan struct {
+	exists    bool
+	upgradeID string
+}
+
+// EnsureProxiedIPv4 checks the whole set for conflicts before writing any records.
+// After an API error it returns the completed operations so that a retry can resume safely.
+func (c *Client) EnsureProxiedIPv4(ctx context.Context, zoneID string, names []string, origin netip.Addr, ipv6Only bool) ([]WebProxyResult, error) {
+	if !origin.Is4() || len(names) == 0 {
+		return nil, fmt.Errorf("需要具体域名和 IPv4 源站地址")
+	}
+	plans := make([]webProxyPlan, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for i, name := range names {
+		if name == "" || strings.Contains(name, "*") {
+			return nil, fmt.Errorf("需要具体域名")
+		}
+		key := strings.ToLower(name)
+		if _, duplicate := seen[key]; duplicate {
+			return nil, fmt.Errorf("域名重复: %s", name)
+		}
+		seen[key] = struct{}{}
+		var err error
+		plans[i], err = c.planWebProxy(ctx, zoneID, name, origin, ipv6Only)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	results := make([]WebProxyResult, 0, len(names))
+	for i, name := range names {
+		plan := plans[i]
+		switch {
+		case !plan.exists:
+			req := CreateRequest{Type: "A", Name: name, Content: origin.String(), TTL: 1, Proxied: true, Comment: RecordComment}
+			if ipv6Only {
+				req.Settings = &DNSRecordSettings{IPv6Only: true}
+			}
+			if _, err := c.CreateRecord(ctx, zoneID, req); err != nil {
+				return results, fmt.Errorf("创建 %s 失败: %w", name, err)
+			}
+		case plan.upgradeID != "":
+			path := "/zones/" + url.PathEscape(zoneID) + "/dns_records/" + url.PathEscape(plan.upgradeID)
+			settings := map[string]map[string]bool{"settings": {"ipv4_only": false, "ipv6_only": false}}
+			var record Record
+			if _, err := c.do(ctx, "PATCH", path, nil, settings, &record); err != nil {
+				return results, fmt.Errorf("恢复 %s 双栈失败: %w", name, err)
+			}
+			if record.ID != plan.upgradeID || record.Settings.IPv4Only || record.Settings.IPv6Only {
+				return results, fmt.Errorf("未能确认 %s 已恢复双栈", name)
+			}
+		}
+		results = append(results, WebProxyResult{Name: name, Created: !plan.exists, Updated: plan.upgradeID != ""})
+	}
+	return results, nil
+}
+
+func (c *Client) planWebProxy(ctx context.Context, zoneID, hostname string, origin netip.Addr, ipv6Only bool) (webProxyPlan, error) {
+	var plan webProxyPlan
+	records, err := c.listRecords(ctx, zoneID, "", hostname)
+	if err != nil {
+		return plan, err
+	}
+	for _, r := range records {
+		if !strings.EqualFold(strings.TrimSuffix(r.Name, "."), hostname) {
+			continue
+		}
+		switch r.Type {
+		case "A":
+			if !plan.exists && r.Content == origin.String() && r.Proxied {
+				if !r.Settings.IPv4Only && r.Settings.IPv6Only == ipv6Only {
+					plan.exists = true
+					continue
+				}
+				if !ipv6Only && r.Managed() && r.ID != "" {
+					plan = webProxyPlan{exists: true, upgradeID: r.ID}
+					continue
+				}
+			}
+			fallthrough
+		case "AAAA", "CNAME", "NS":
+			return webProxyPlan{}, fmt.Errorf("%s 已有冲突的 %s 记录，请选择新子域名或在 Cloudflare 面板核对现有配置", hostname, r.Type)
+		}
+	}
+	return plan, nil
+}
+
 // CreateRequest 是建一条记录需要的字段。
 type CreateRequest struct {
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	TTL     int    `json:"ttl"`
-	Proxied bool   `json:"proxied"`
-	Comment string `json:"comment,omitempty"`
+	Type     string             `json:"type"`
+	Name     string             `json:"name"`
+	Content  string             `json:"content"`
+	TTL      int                `json:"ttl"`
+	Proxied  bool               `json:"proxied"`
+	Comment  string             `json:"comment,omitempty"`
+	Settings *DNSRecordSettings `json:"settings,omitempty"`
 }
 
 // CreateRecord 建一条记录。带 comment 被拒时会去掉 comment 再试一次，

@@ -226,33 +226,45 @@ func (s *Store) TrackAddr(iface, prefix string) error {
 			return nil
 		}
 	}
-	s.state.Managed = append(s.state.Managed, ManagedAddr{
+	next := s.state
+	next.Managed = append(append([]ManagedAddr(nil), s.state.Managed...), ManagedAddr{
 		Iface:     iface,
 		Prefix:    prefix,
 		CreatedAt: time.Now().UTC(),
 	})
-	sort.SliceStable(s.state.Managed, func(i, j int) bool {
-		if s.state.Managed[i].Iface != s.state.Managed[j].Iface {
-			return s.state.Managed[i].Iface < s.state.Managed[j].Iface
+	sort.SliceStable(next.Managed, func(i, j int) bool {
+		if next.Managed[i].Iface != next.Managed[j].Iface {
+			return next.Managed[i].Iface < next.Managed[j].Iface
 		}
-		return s.state.Managed[i].Prefix < s.state.Managed[j].Prefix
+		return next.Managed[i].Prefix < next.Managed[j].Prefix
 	})
-	return writeJSON(s.statePath(), s.state)
+	if err := writeJSON(s.statePath(), next); err != nil {
+		return err
+	}
+	s.state = next
+	return nil
 }
 
 // UntrackAddr 取消登记。
 func (s *Store) UntrackAddr(iface, prefix string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := s.state.Managed[:0]
+	next := s.state
+	next.Managed = make([]ManagedAddr, 0, len(s.state.Managed))
 	for _, m := range s.state.Managed {
 		if m.Iface == iface && m.Prefix == prefix {
 			continue
 		}
-		out = append(out, m)
+		next.Managed = append(next.Managed, m)
 	}
-	s.state.Managed = out
-	return writeJSON(s.statePath(), s.state)
+	if len(next.Managed) == len(s.state.Managed) {
+		return nil
+	}
+	if err := writeJSON(s.statePath(), next); err != nil {
+		return err
+	}
+	s.state = next
+	return nil
 }
 
 // IsManaged 判断某个地址是不是本工具加的。

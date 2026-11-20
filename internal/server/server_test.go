@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -75,6 +76,9 @@ func (f *fakeManager) AddAddr(_ string, p netip.Prefix) error {
 func (f *fakeManager) DelAddr(_ string, p netip.Prefix) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.fail != nil {
+		return f.fail
+	}
 	out := f.addrs[:0]
 	for _, a := range f.addrs {
 		if a.Addr == p.Addr() {
@@ -160,6 +164,69 @@ func TestUnauthenticatedBlocked(t *testing.T) {
 		if res.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("%s 该返回 401，拿到 %d", p, res.StatusCode)
 		}
+	}
+}
+
+func TestGenerateAddsAndTracksAddresses(t *testing.T) {
+	srv, mgr := newTestServer(t)
+	c := &client{t: t, srv: srv.Handler()}
+	c.login("hunter2")
+	csrf := c.csrf
+	c.csrf = ""
+	path := "/api/addresses/generate"
+	payload := `{"iface":"eth0","count":2}`
+	if res, _ := c.do("POST", path, payload); res.StatusCode != http.StatusForbidden {
+		t.Fatalf("没有 CSRF 时返回 %d", res.StatusCode)
+	}
+	c.csrf = csrf
+	if res, _ := c.do("POST", path, `{"iface":"eth0","count":1001}`); res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("数量超限时返回 %d", res.StatusCode)
+	}
+	res, body := c.do("POST", path, payload)
+	var result opResult
+	if res.StatusCode != http.StatusOK || json.Unmarshal([]byte(body), &result) != nil || result.Succeed != 2 {
+		t.Fatalf("生成并添加失败：%d %s", res.StatusCode, body)
+	}
+	if got := len(mgr.addrs); got != 3 {
+		t.Fatalf("网卡地址数 = %d，预期 3", got)
+	}
+	for _, item := range result.Items {
+		if !srv.store.IsManaged("eth0", item.Target) {
+			t.Errorf("未保存 %s", item.Target)
+		}
+	}
+}
+
+func TestAddressFailuresKeepStateConsistent(t *testing.T) {
+	srv, mgr := newTestServer(t)
+	c := &client{t: t, srv: srv.Handler()}
+	c.login("hunter2")
+	const addr = "2001:db8::3/64"
+	const payload = `{"iface":"eth0","addrs":["` + addr + `"]}`
+	if err := os.Mkdir(srv.store.StatePath(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, body := c.do("POST", "/api/addresses/add", payload)
+	if !strings.Contains(body, `"failed":1`) || len(mgr.addrs) != 1 || srv.store.IsManaged("eth0", addr) {
+		t.Fatalf("保存失败后应撤销添加：%s", body)
+	}
+	if err := os.Remove(srv.store.StatePath()); err != nil {
+		t.Fatal(err)
+	}
+	_, body = c.do("POST", "/api/addresses/add", payload)
+	if !strings.Contains(body, `"succeed":1`) {
+		t.Fatalf("重试添加失败：%s", body)
+	}
+	mgr.fail = fmt.Errorf("删除失败")
+	_, body = c.do("POST", "/api/addresses/delete", payload)
+	if !strings.Contains(body, `"failed":1`) || !srv.store.IsManaged("eth0", addr) {
+		t.Fatalf("删除失败后应保留记录：%s", body)
+	}
+	mgr.fail = nil
+	dup := `{"iface":"eth0","addrs":["` + addr + `","` + addr + `"]}`
+	res, body := c.do("POST", "/api/addresses/delete", dup)
+	if res.StatusCode != http.StatusOK || !strings.Contains(body, `"succeed":1`) || srv.store.IsManaged("eth0", addr) {
+		t.Fatalf("同一地址应只删除一次：%d %s", res.StatusCode, body)
 	}
 }
 

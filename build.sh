@@ -19,10 +19,18 @@ for t in "${targets[@]}"; do
   os="${t%/*}"
   arch="${t#*/}"
   name="addipv6-${os}-${arch}"
-  env CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=7 \
+  env CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=6 \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "$OUT/$name" .
   echo "  $name  $(du -h "$OUT/$name" | cut -f1)"
 done
 
-( cd "$OUT" && shasum -a 256 addipv6-* > SHA256SUMS 2>/dev/null || sha256sum addipv6-* > SHA256SUMS )
+(
+  cd "$OUT"
+  assets=(addipv6-linux-{amd64,arm64,arm,386,riscv64})
+  if command -v sha256sum >/dev/null; then
+    sha256sum "${assets[@]}"
+  else
+    shasum -a 256 "${assets[@]}"
+  fi > SHA256SUMS
+)
 echo "校验和写在 $OUT/SHA256SUMS"

@@ -106,6 +106,7 @@ func (s *Server) routes() {
 	mux.HandleFunc("GET /api/state", s.requireAuth(s.handleState))
 	mux.HandleFunc("POST /api/addresses/preview", s.requireAuth(s.handlePreview))
 	mux.HandleFunc("POST /api/addresses/add", s.requireAuth(s.handleAddAddrs))
+	mux.HandleFunc("POST /api/addresses/generate", s.requireAuth(s.handleGenerateAddrs))
 	mux.HandleFunc("POST /api/addresses/delete", s.requireAuth(s.handleDeleteAddrs))
 	mux.HandleFunc("POST /api/route/source", s.requireAuth(s.handleSetSource))
 	mux.HandleFunc("POST /api/persist", s.requireAuth(s.handlePersist))

@@ -263,6 +263,13 @@ func (m linuxManager) SetDefaultRoute(iface string, gw, src netip.Addr, onLink b
 		Src:       net.IP(src.AsSlice()),
 		Family:    netlink.FAMILY_V6,
 	}
+	routes, err := netlink.RouteList(link, netlink.FAMILY_V6)
+	if err != nil {
+		return fmt.Errorf("读取默认路由失败: %w", err)
+	}
+	if existing := pickDefaultRoute(routes, link.Attrs().Index, iface); existing != nil {
+		route.Priority = existing.Metric
+	}
 	// 隧道这类点对点链路没有网关，下发成 `default dev xxx` 就行；
 	// 硬要带 Gw 反而会被内核拒掉。
 	if gw.IsValid() {

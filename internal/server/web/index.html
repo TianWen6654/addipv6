@@ -85,11 +85,12 @@
         <div class="row">
           <div class="field">
             <span>生成</span>
-            <input id="count" type="number" min="1" max="1000" value="10" class="w-count">
+            <input id="count" type="number" min="1" max="1000" value="10" required class="w-count">
             <span>个</span>
           </div>
-          <button class="primary" id="gen"><svg class="icon"><use href="#i-dice"/></svg>随机生成</button>
-          <label class="check"><input type="checkbox" id="auto-add">生成完直接加到网卡</label>
+          <button class="primary" id="gen-add"><svg class="icon"><use href="#i-plus"/></svg>生成并添加</button>
+          <button id="gen">预览随机地址</button>
+          <button id="gen-publish" class="hidden">生成、添加并解析</button>
         </div>
 
         <div class="row">

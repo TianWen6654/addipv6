@@ -246,8 +246,6 @@ function renderAddrs() {
     + '；勾中 ' + picked.length + ' 个';
   $('#addr-stat').textContent = S.iface || '-';
 
-  const canSend = activePicked.length > 0 && S.cf.configured && S.cf.zoneId;
-  $('#cf-create').disabled = !canSend;
   $('#cf-create-label').textContent = activePicked.length
     ? '把勾中的 ' + activePicked.length + ' 个解析过去'
     : '解析勾中的地址';
@@ -286,6 +284,9 @@ function renderHeader() {
   if (S.prefix && list.includes(S.prefix)) ps.value = S.prefix;
   else S.prefix = list[0] || '';
   ps.value = S.prefix;
+  $('#gen').disabled = !S.prefix;
+  $('#gen-add').disabled = !S.prefix || S.platform !== 'linux';
+  $('#gen-publish').disabled = $('#gen-add').disabled;
 
   $('#ver').textContent = S.version || '';
   const plat = $('#platform');
@@ -297,6 +298,9 @@ function renderHeader() {
 /* ---------- Cloudflare ---------- */
 
 function updateHint() {
+  const hasZone = S.cf.configured && !!S.cf.zoneId;
+  $('#gen-publish').classList.toggle('hidden', !hasZone || S.platform !== 'linux');
+  $('#cf-create').disabled = !hasZone || !S.rows.some((r) => r.status === 'active' && S.checked.has(r.key));
   const name = $('#cf-name').value.trim();
   const zone = S.cf.zoneName || '你的域名';
   const n = S.rows.filter((r) => S.checked.has(r.key) && r.status === 'active').length || 2;
@@ -304,13 +308,19 @@ function updateHint() {
   if (/\{(n|i)(:\d+)?\}/.test(name)) {
     const one = name.replace(/\{(n|i)(:(\d+))?\}/g, (m, k, _c, w) => {
       const v = k === 'n' ? 1 : 0;
-      return w ? String(v).padStart(Number(w), '0') : String(v);
+      const width = Number(w);
+      return width > 0 && width <= 12 ? String(v).padStart(width, '0') : String(v);
     });
-    hint.textContent = '每个地址一条记录，第一条是 ' + (one ? one + '.' + zone : zone) + '。';
+    hint.textContent = '每个地址一条记录，第一条是 ' + qualifyDNSName(one, zone) + '。';
   } else {
-    const full = name && name !== '@' ? name + '.' + zone : zone;
-    hint.textContent = n + ' 个地址会全挂在 ' + full + ' 上做轮询。想一个地址一条就在名字里写 {n}。';
+    hint.textContent = n + ' 个地址会全挂在 ' + qualifyDNSName(name, zone) + ' 上做轮询。想一个地址一条就在名字里写 {n}。';
   }
+}
+
+function qualifyDNSName(name, zone) {
+  name = name.toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (!name || name === '@') return zone;
+  return name === zone || name.endsWith('.' + zone) ? name : name + '.' + zone;
 }
 
 function modeLabel(m) { return m === 'globalkey' ? '全局 Key' : 'Token'; }
@@ -442,7 +452,6 @@ async function boot() {
   try {
     await loadState();
     if (S.cf.configured) await loadZones(true);
-    log('准备好了。配置在 ' + (await api('GET', '/api/state')).configPath);
   } catch (e) { fail(e); }
 }
 
@@ -462,36 +471,70 @@ $('#reload').addEventListener('click', async () => {
   try { await loadState(); } catch (e) { fail(e); }
 });
 
-$('#gen').addEventListener('click', async () => {
+async function generateAddresses(apply, publish) {
+  if (S.busy) return;
   const count = Number($('#count').value);
-  if (!count || count < 1) { toast('数量填个正数', 'err'); return; }
+  if (!$('#count').reportValidity() || !count) return;
+  if (!S.iface) { toast('没有可用的 IPv6 网卡', 'err'); return; }
+  const iface = S.iface;
+  const prefix = S.prefix;
+  const dns = publish ? dnsOptions() : null;
+  if (dns) {
+    if (!dns.zoneId) return;
+    const c = await confirmBox({
+      title: '生成并解析 ' + count + ' 个地址',
+      text: '网卡 ' + iface + '，Cloudflare 站点 ' + dns.zoneName + '，记录名 ' + (dns.name || '@') + '。只解析添加成功的地址。',
+    });
+    if (!c.ok || S.busy || S.iface !== iface) return;
+  }
   busy(true);
   try {
-    const r = await api('POST', '/api/addresses/preview', { iface: S.iface, prefix: S.prefix, count });
+    const action = apply ? 'generate' : 'preview';
+    const r = await api('POST', '/api/addresses/' + action, { iface, prefix, count });
+    if (apply) {
+      if (S.iface === iface && r.succeed) S.checked.clear();
+      await showAddResult(iface, r);
+      if (dns && r.succeed) {
+        await createRecords(dns, r.items.filter((it) => it.ok).map((it) => it.target.split('/')[0]));
+      }
+      return;
+    }
+    if (S.iface !== iface) return;
     S.pending = [...new Set([...r.addrs, ...S.pending])];
     for (const a of r.addrs) S.checked.add(a);
     rebuildRows(); renderAddrs();
     log('在 ' + r.prefix + ' 里生成了 ' + r.addrs.length + ' 个', 'ok');
     if (r.warning) log(r.warning, 'warn');
-    if ($('#auto-add').checked) await addPending();
   } catch (e) { fail(e); } finally { busy(false); }
-});
+}
+
+$('#gen').addEventListener('click', () => generateAddresses(false));
+$('#gen-add').addEventListener('click', () => generateAddresses(true));
+$('#gen-publish').addEventListener('click', () => generateAddresses(true, true));
 
 async function addPending() {
+  if (S.busy) return;
   const targets = S.rows.filter((r) => r.status === 'pending' && S.checked.has(r.key)).map((r) => r.key);
   if (!targets.length) return;
+  const iface = S.iface;
   busy(true);
   try {
-    const res = await api('POST', '/api/addresses/add', { iface: S.iface, addrs: targets });
-    log('加到 ' + S.iface + '：成功 ' + res.succeed + '，失败 ' + res.failed, res.failed ? 'warn' : 'ok');
-    for (const it of res.items) if (!it.ok) log('  ' + it.target + ' → ' + it.error, 'err');
-    if (res.warning) { log(res.warning, 'warn'); toast('出站源地址变了，看日志', 'warn'); }
-    S.pending = S.pending.filter((p) => !res.items.some((i) => i.ok && i.target === p));
-    await loadState(true);
-    for (const it of res.items) if (it.ok) S.checked.add(it.target);
-    renderAddrs();
-    if (res.succeed) toast('加上了 ' + res.succeed + ' 个');
+    const res = await api('POST', '/api/addresses/add', { iface, addrs: targets });
+    await showAddResult(iface, res);
   } catch (e) { fail(e); } finally { busy(false); }
+}
+
+async function showAddResult(iface, res) {
+  log('加到 ' + iface + '：成功 ' + res.succeed + '，失败 ' + res.failed, res.failed ? 'warn' : 'ok');
+  for (const it of res.items) if (!it.ok) log('  ' + it.target + ' → ' + it.error, 'err');
+  if (res.warning) { log(res.warning, 'warn'); toast('出站源地址变了，看日志', 'warn'); }
+  const added = new Set(res.items.filter((it) => it.ok).map((it) => it.target));
+  if (S.iface === iface) S.pending = S.pending.filter((p) => !added.has(p));
+  if (res.failed) toast('添加失败 ' + res.failed + ' 个，查看日志', 'warn');
+  else if (res.succeed) toast('加上了 ' + res.succeed + ' 个');
+  try { await loadState(true); } catch (e) { fail(e); }
+  if (S.iface === iface) for (const target of added) S.checked.add(target);
+  renderAddrs();
 }
 
 $('#add-pending').addEventListener('click', addPending);
@@ -500,23 +543,28 @@ $('#del-addr').addEventListener('click', async () => {
   const targets = S.rows.filter((r) => S.checked.has(r.key));
   const live = targets.filter((r) => r.status === 'active').map((r) => r.key);
   const ghosts = targets.filter((r) => r.status === 'pending').map((r) => r.key);
+  const iface = S.iface;
+  let force = false;
+  if (live.length) {
+    const hasSource = targets.some((r) => r.isSource);
+    const c = await confirmBox({
+      title: '删 ' + targets.length + ' 个地址',
+      text: hasSource ? '里面有当前出口地址，删了出站会断。' : '从 ' + iface + ' 上摘掉所选地址，并丢弃所选预览。',
+      list: targets.map((r) => r.key),
+      force: true,
+    });
+    if (!c.ok || S.iface !== iface) return;
+    force = c.force;
+  }
   if (ghosts.length) {
     S.pending = S.pending.filter((p) => !ghosts.includes(p));
     for (const g of ghosts) S.checked.delete(g);
+    rebuildRows(); renderAddrs();
   }
-  if (!live.length) { rebuildRows(); renderAddrs(); log('丢掉 ' + ghosts.length + ' 个还没下发的'); return; }
-
-  const hasSource = targets.some((r) => r.isSource);
-  const c = await confirmBox({
-    title: '删 ' + live.length + ' 个地址',
-    text: hasSource ? '里面有当前出口地址，删了出站会断。' : '从 ' + S.iface + ' 上摘掉，删完立刻生效。',
-    list: live,
-    force: true,
-  });
-  if (!c.ok) return;
+  if (!live.length) return;
   busy(true);
   try {
-    const res = await api('POST', '/api/addresses/delete', { iface: S.iface, addrs: live, force: c.force });
+    const res = await api('POST', '/api/addresses/delete', { iface, addrs: live, force });
     log('删除：成功 ' + res.succeed + '，失败 ' + res.failed, res.failed ? 'warn' : 'ok');
     for (const it of res.items) if (!it.ok) log('  ' + it.target + ' → ' + it.error, 'err');
     S.checked.clear();
@@ -637,6 +685,22 @@ $('#cf-reload-zones').addEventListener('click', () => loadZones(false));
 $('#cf-reload-records').addEventListener('click', () => loadRecords(false));
 $('#cf-name').addEventListener('input', updateHint);
 
+function dnsOptions() {
+  return {
+    zoneId: S.cf.zoneId, zoneName: S.cf.zoneName, name: $('#cf-name').value.trim(),
+    ttl: Number($('#cf-ttl').value) || 60, proxied: $('#cf-proxied').checked,
+  };
+}
+
+async function createRecords(dns, addrs) {
+  const res = await api('POST', '/api/cf/records/create', { ...dns, addrs });
+  log('解析完成：新建 ' + res.created + '，已存在跳过 ' + res.skipped + '，失败 ' + res.failed,
+    res.failed ? 'warn' : 'ok');
+  for (const it of res.items) if (it.error) log('  ' + it.name + ' ' + it.content + ' → ' + it.error, 'err');
+  toast('新建 ' + res.created + ' 条' + (res.failed ? '，失败 ' + res.failed + ' 条' : ''), res.failed ? 'warn' : undefined);
+  if (S.cf.zoneId === dns.zoneId) await loadRecords(true);
+}
+
 $('#cf-create').addEventListener('click', async () => {
   const picked = S.rows.filter((r) => S.checked.has(r.key));
   const live = picked.filter((r) => r.status === 'active').map((r) => r.addr);
@@ -644,26 +708,18 @@ $('#cf-create').addEventListener('click', async () => {
   if (!live.length) { toast('先勾几个已经在网卡上的地址', 'err'); return; }
   if (ghosts.length) log(ghosts.length + ' 个还没加到网卡，这次跳过它们', 'warn');
 
-  const name = $('#cf-name').value.trim();
-  const rr = /\{(n|i)(:\d+)?\}/.test(name);
+  const dns = dnsOptions();
+  const rr = /\{(n|i)(:\d+)?\}/.test(dns.name);
   const c = await confirmBox({
-    title: '解析 ' + live.length + ' 个地址到 ' + S.cf.zoneName,
+    title: '解析 ' + live.length + ' 个地址到 ' + dns.zoneName,
     text: rr ? '每个地址一条 AAAA。' : '全部挂在同一个名字下做轮询。',
     list: live,
   });
-  if (!c.ok) return;
+  if (!c.ok || S.busy) return;
 
   busy(true);
   try {
-    const res = await api('POST', '/api/cf/records/create', {
-      zoneId: S.cf.zoneId, zoneName: S.cf.zoneName, name,
-      addrs: live, ttl: Number($('#cf-ttl').value) || 60, proxied: $('#cf-proxied').checked,
-    });
-    log('解析完成：新建 ' + res.created + '，已存在跳过 ' + res.skipped + '，失败 ' + res.failed,
-      res.failed ? 'warn' : 'ok');
-    for (const it of res.items) if (it.error) log('  ' + it.name + ' ' + it.content + ' → ' + it.error, 'err');
-    toast('新建 ' + res.created + ' 条');
-    await loadRecords(true);
+    await createRecords(dns, live);
   } catch (e) { fail(e); } finally { busy(false); }
 });
 

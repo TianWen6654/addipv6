@@ -178,14 +178,21 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Count <= 0 || req.Count > maxBatch {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("数量要在 1 到 %d 之间", maxBatch))
-		return
-	}
-	it, p, err := s.resolvePrefix(req.Iface, req.Prefix)
+	out, err := s.generateAddrs(req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) generateAddrs(req previewRequest) (previewResponse, error) {
+	if req.Count <= 0 || req.Count > maxBatch {
+		return previewResponse{}, fmt.Errorf("数量要在 1 到 %d 之间", maxBatch)
+	}
+	it, p, err := s.resolvePrefix(req.Iface, req.Prefix)
+	if err != nil {
+		return previewResponse{}, err
 	}
 
 	exclude := map[netip.Addr]struct{}{}
@@ -198,8 +205,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 
 	addrs, err := netif.GenerateBatch(p, req.Count, exclude)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return previewResponse{}, err
 	}
 	out := previewResponse{Prefix: p.String()}
 	for _, a := range addrs {
@@ -208,7 +214,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	if p.Bits() != 64 {
 		out.Warning = fmt.Sprintf("这个网段是 /%d，不是常见的 /64，确认一下是不是你要的", p.Bits())
 	}
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
 }
 
 type addrBatchRequest struct {
@@ -260,13 +266,33 @@ func (s *Server) handleAddAddrs(w http.ResponseWriter, r *http.Request) {
 
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	writeJSON(w, http.StatusOK, s.addAddrs(req.Iface, req.Addrs))
+}
 
+func (s *Server) handleGenerateAddrs(w http.ResponseWriter, r *http.Request) {
+	var req previewRequest
+	if err := readJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	preview, err := s.generateAddrs(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.addAddrs(req.Iface, preview.Addrs))
+}
+
+// addAddrs runs with opMu held by its caller.
+func (s *Server) addAddrs(iface string, addrs []string) opResult {
 	// 内核按 RFC 6724 挑出站源地址，多加几个同段地址就可能把出口换掉，
 	// 哪怕一行路由都没动。已有服务绑着旧地址的话这会很难查，所以加完对一下。
-	sourceBefore := s.currentSource(req.Iface)
+	sourceBefore := s.currentSource(iface)
 
 	res := opResult{}
-	for _, raw := range req.Addrs {
+	for _, raw := range addrs {
 		p, err := netif.ParsePrefix(raw, 64)
 		item := opItem{Target: raw}
 		if err != nil {
@@ -276,25 +302,28 @@ func (s *Server) handleAddAddrs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		item.Target = p.String()
-		if err := s.mgr.AddAddr(req.Iface, p); err != nil {
+		if err := s.mgr.AddAddr(iface, p); err != nil {
 			item.Error = err.Error()
+			res.Failed++
+		} else if err := s.store.TrackAddr(iface, p.String()); err != nil {
+			item.Error = "保存地址记录失败: " + err.Error()
+			if undoErr := s.mgr.DelAddr(iface, p); undoErr != nil && !errors.Is(undoErr, netif.ErrAddrNotFound) {
+				item.Error += "；撤销添加失败，请检查网卡: " + undoErr.Error()
+			}
 			res.Failed++
 		} else {
 			item.OK = true
 			res.Succeed++
-			if err := s.store.TrackAddr(req.Iface, p.String()); err != nil {
-				s.log.Error("记录地址失败", "err", err)
-			}
 		}
 		res.Items = append(res.Items, item)
 	}
-	if sourceAfter := s.currentSource(req.Iface); sourceBefore != "" && sourceAfter != "" && sourceBefore != sourceAfter {
+	if sourceAfter := s.currentSource(iface); sourceBefore != "" && sourceAfter != "" && sourceBefore != sourceAfter {
 		res.Warning = "注意：出站源地址被内核从 " + sourceBefore + " 换成了 " + sourceAfter +
 			"。想钉死用哪个就勾中它点「设为出口」。"
-		s.log.Warn("添加地址后出口变了", "iface", req.Iface, "从", sourceBefore, "到", sourceAfter)
+		s.log.Warn("添加地址后出口变了", "iface", iface, "从", sourceBefore, "到", sourceAfter)
 	}
-	s.log.Info("批量添加地址", "iface", req.Iface, "成功", res.Succeed, "失败", res.Failed)
-	writeJSON(w, http.StatusOK, res)
+	s.log.Info("批量添加地址", "iface", iface, "成功", res.Succeed, "失败", res.Failed)
+	return res
 }
 
 func (s *Server) handleDeleteAddrs(w http.ResponseWriter, r *http.Request) {
@@ -305,6 +334,10 @@ func (s *Server) handleDeleteAddrs(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Addrs) == 0 {
 		writeError(w, http.StatusBadRequest, "没给要删除的地址")
+		return
+	}
+	if len(req.Addrs) > maxBatch {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("一次最多 %d 个", maxBatch))
 		return
 	}
 
@@ -335,6 +368,7 @@ func (s *Server) handleDeleteAddrs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targets := make([]netip.Prefix, 0, len(req.Addrs))
+	seen := make(map[netip.Prefix]bool)
 	res := opResult{}
 	for _, raw := range req.Addrs {
 		p, err := netif.ParsePrefix(raw, 64)
@@ -343,7 +377,10 @@ func (s *Server) handleDeleteAddrs(w http.ResponseWriter, r *http.Request) {
 			res.Failed++
 			continue
 		}
-		targets = append(targets, p)
+		if !seen[p] {
+			targets = append(targets, p)
+			seen[p] = true
+		}
 	}
 
 	if !req.Force {
@@ -368,16 +405,15 @@ func (s *Server) handleDeleteAddrs(w http.ResponseWriter, r *http.Request) {
 			res.Items = append(res.Items, item)
 			continue
 		}
-		if err := s.mgr.DelAddr(req.Iface, p); err != nil {
+		if err := s.mgr.DelAddr(req.Iface, p); err != nil && !errors.Is(err, netif.ErrAddrNotFound) {
 			item.Error = err.Error()
+			res.Failed++
+		} else if err := s.store.UntrackAddr(req.Iface, p.String()); err != nil {
+			item.Error = "网卡上已无此地址，清理地址记录失败: " + err.Error()
 			res.Failed++
 		} else {
 			item.OK = true
 			res.Succeed++
-		}
-		// 不管内核那边删没删掉，本地登记都要清，不然状态会对不上。
-		if err := s.store.UntrackAddr(req.Iface, p.String()); err != nil {
-			s.log.Error("清理地址记录失败", "err", err)
 		}
 		res.Items = append(res.Items, item)
 	}
